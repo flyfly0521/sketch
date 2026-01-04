@@ -2,11 +2,10 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from models.seq_transfomer import SketchTransformer
-from dataset import Quickdraw414k4VanillaTransformer
 
 # =========================
 # Config
@@ -24,7 +23,6 @@ TRAIN_ROOT = "../dataset/QuickDraw414k/coordinate_files/train"
 TEST_ROOT  = "../dataset/QuickDraw414k/coordinate_files/test"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 # =========================
 # Sketch preprocessing
@@ -45,6 +43,64 @@ def process_one_sketch(npy_path):
 
     return coord, pen_down, stroke_len
 
+# =========================
+# Masks
+# =========================
+def generate_attention_mask(stroke_length):
+    mask = torch.zeros((MAX_LEN, MAX_LEN), dtype=torch.float32)
+    mask[stroke_length:, :] = -1e8
+    mask[:, stroke_length:] = -1e8
+    return mask
+
+def generate_padding_mask(stroke_length):
+    mask = torch.ones((MAX_LEN, 1), dtype=torch.float32)
+    mask[stroke_length:, :] = 0
+    return mask
+
+# =========================
+# Dataset
+# =========================
+class QuickdrawDataset(Dataset):
+    def __init__(self, sketch_list_path, root_dir):
+        self.root_dir = root_dir
+        self.samples = []
+
+        with open(sketch_list_path, "r") as f:
+            for line in f:
+                png_path, label = line.strip().split()
+                npy_rel_path = png_path.replace("png", "npy")
+                self.samples.append((npy_rel_path, int(label)))
+
+        print(f"Loaded {len(self.samples)} samples from {sketch_list_path}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        npy_rel_path, label = self.samples[idx]
+        npy_path = os.path.join(self.root_dir, npy_rel_path)
+
+        coord, flag_bits, stroke_len = process_one_sketch(npy_path)
+
+        # 截断/填充到 MAX_LEN
+        if coord.shape[0] > MAX_LEN:
+            coord = coord[:MAX_LEN]
+            flag_bits = flag_bits[:MAX_LEN]
+            stroke_len = MAX_LEN
+        else:
+            pad_len = MAX_LEN - coord.shape[0]
+            coord = np.pad(coord, ((0, pad_len), (0, 0)), mode="constant")
+            flag_bits = np.pad(flag_bits, (0, pad_len), mode="constant")
+
+        coord = torch.from_numpy(coord).float() / 255.0  # 归一化到 [0,1]
+        flag_bits = torch.from_numpy(flag_bits).float().unsqueeze(1)
+
+        # masks & position encoding
+        attention_mask = generate_attention_mask(stroke_len)
+        padding_mask = generate_padding_mask(stroke_len)
+        position_encoding = torch.arange(MAX_LEN, dtype=torch.float32).unsqueeze(1)
+
+        return coord, label, flag_bits, stroke_len, attention_mask, padding_mask, position_encoding
 
 # =========================
 # Evaluation
@@ -52,34 +108,18 @@ def process_one_sketch(npy_path):
 @torch.no_grad()
 def evaluate(model, dataloader, criterion):
     model.eval()
-
     total_loss = 0.0
     correct = 0
     total = 0
 
-    for (
-        coordinate,
-        label,
-        flag_bits,
-        stroke_len,
-        attention_mask,
-        padding_mask,
-        position_encoding
-    ) in dataloader:
-
-        coordinate = coordinate.to(DEVICE).float()
-        flag_bits = flag_bits.to(DEVICE).float()
+    for coordinate, label, flag_bits, stroke_len, attention_mask, padding_mask, position_encoding in dataloader:
+        coordinate = coordinate.to(DEVICE)
+        flag_bits = flag_bits.to(DEVICE)
         attention_mask = attention_mask.to(DEVICE)
         padding_mask = padding_mask.to(DEVICE)
         label = label.to(DEVICE)
 
-        logits = model(
-            coordinate,
-            flag_bits,
-            padding_mask,
-            attention_mask
-        )
-
+        logits = model(coordinate, flag_bits, padding_mask, attention_mask)
         loss = criterion(logits, label)
 
         total_loss += loss.item()
@@ -89,89 +129,23 @@ def evaluate(model, dataloader, criterion):
 
     return total_loss / len(dataloader), correct / total
 
-
 # =========================
 # Main
 # =========================
 def main():
     # =========================
-    # Build TRAIN data_dict
-    # =========================
-    print("Building train data_dict...")
-    train_data_dict = {}
-
-    with open(TRAIN_SKETCH_LIST) as f:
-        for line in f:
-            png_path, label = line.strip().split()
-            npy_rel_path = png_path.replace("png", "npy")
-            npy_path = os.path.join(TRAIN_ROOT, npy_rel_path)
-
-            if not os.path.exists(npy_path):
-                raise FileNotFoundError(npy_path)
-
-            coord, flag_bits, stroke_len = process_one_sketch(npy_path)
-
-            train_data_dict[npy_rel_path] = (
-                torch.from_numpy(coord),
-                torch.from_numpy(flag_bits),
-                stroke_len
-            )
-
-            if len(train_data_dict) % 1000 == 0:
-                print(f"Train sketches: {len(train_data_dict)}")
-
-    print(f"Train sketches: {len(train_data_dict)}")
-
-    # =========================
-    # Build TEST data_dict
-    # =========================
-    print("Building test data_dict...")
-    test_data_dict = {}
-
-    with open(TEST_SKETCH_LIST) as f:
-        for line in f:
-            png_path, label = line.strip().split()
-            npy_rel_path = png_path.replace("png", "npy")
-            npy_path = os.path.join(TEST_ROOT, npy_rel_path)
-
-            if not os.path.exists(npy_path):
-                raise FileNotFoundError(npy_path)
-
-            coord, flag_bits, stroke_len = process_one_sketch(npy_path)
-
-            test_data_dict[npy_rel_path] = (
-                torch.from_numpy(coord),
-                torch.from_numpy(flag_bits),
-                stroke_len
-            )
-
-            if len(test_data_dict) % 1000 == 0:
-                print(f"Test sketches: {len(test_data_dict)}")
-
-    print(f"Test sketches: {len(test_data_dict)}")
-
-    # =========================
     # Dataset & DataLoader
     # =========================
-    train_dataset = Quickdraw414k4VanillaTransformer(
-        sketch_list=TRAIN_SKETCH_LIST,
-        data_dict=train_data_dict
-    )
-
-    test_dataset = Quickdraw414k4VanillaTransformer(
-        sketch_list=TEST_SKETCH_LIST,
-        data_dict=test_data_dict
-    )
+    train_dataset = QuickdrawDataset(TRAIN_SKETCH_LIST, TRAIN_ROOT)
+    test_dataset  = QuickdrawDataset(TEST_SKETCH_LIST, TEST_ROOT)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,  
-        pin_memory=False
+        num_workers=4,
+        pin_memory=True
     )
-
-
 
     test_loader = DataLoader(
         test_dataset,
@@ -184,68 +158,34 @@ def main():
     # =========================
     # Model
     # =========================
-    model = SketchTransformer(
-        embed_dim=128,
-        num_heads=4,
-        num_layers=4,
-        num_classes=NUM_CLASSES
-    ).to(DEVICE)
-
+    model = SketchTransformer(embed_dim=128, num_heads=4, num_layers=4, num_classes=NUM_CLASSES).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LR,
-        weight_decay=1e-4
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=20,
-        gamma=0.5
-    )
-
-    # =========================
-    # Training loop
-    # =========================
+    #训练中断后这里调参可以加载之前保存的模型恢复训练
     best_test_acc = 0.0
-
+    model.load_state_dict(torch.load("best_model.pth"))
+    ###
+    
     for epoch in range(NUM_EPOCHS):
         model.train()
-
         total_loss = 0.0
         correct = 0
         total = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
-
-        for (
-            coordinate,
-            label,
-            flag_bits,
-            stroke_len,
-            attention_mask,
-            padding_mask,
-            position_encoding
-        ) in pbar:
-
-            coordinate = coordinate.to(DEVICE).float()
-            flag_bits = flag_bits.to(DEVICE).float()
+        for coordinate, label, flag_bits, stroke_len, attention_mask, padding_mask, position_encoding in pbar:
+            coordinate = coordinate.to(DEVICE)
+            flag_bits = flag_bits.to(DEVICE)
             attention_mask = attention_mask.to(DEVICE)
             padding_mask = padding_mask.to(DEVICE)
             label = label.to(DEVICE)
 
             optimizer.zero_grad()
-
-            logits = model(
-                coordinate,
-                flag_bits,
-                padding_mask,
-                attention_mask
-            )
-
+            logits = model(coordinate, flag_bits, padding_mask, attention_mask)
             loss = criterion(logits, label)
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -254,15 +194,9 @@ def main():
             correct += (pred == label).sum().item()
             total += label.size(0)
 
-            pbar.set_postfix(
-                loss=total_loss / (total + 1e-6),
-                acc=correct / total
-            )
+            pbar.set_postfix(loss=total_loss/(total+1e-6), acc=correct/total)
 
         scheduler.step()
-
-        train_loss = total_loss / len(train_loader)
-        train_acc = correct / total
 
         test_loss, test_acc = evaluate(model, test_loader, criterion)
 
@@ -270,17 +204,9 @@ def main():
             best_test_acc = test_acc
             torch.save(model.state_dict(), "best_model.pth")
 
-        print(
-            f"Epoch {epoch}: "
-            f"Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f} | "
-            f"Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}"
-        )
+        print(f"Epoch {epoch}: Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}")
 
     print("Training finished.")
 
-
-# =========================
-# Entry
-# =========================
 if __name__ == "__main__":
     main()
